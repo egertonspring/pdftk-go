@@ -3,13 +3,15 @@ package operations
 
 import (
 	"fmt"
-	"github.com/pdfcpu/pdfcpu/pkg/api"
-	"github.com/pdftk-go/internal/session"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+
+	"github.com/pdfcpu/pdfcpu/pkg/api"
+	"github.com/pdftk-go/internal/session"
 )
 
 // ExecuteCatOperation performs the concatenate operation using pdfcpu
@@ -32,20 +34,17 @@ func ExecuteCatOperation(s *session.TKSession) error {
 		fmt.Printf("Output: %s\n", s.OutputFilename)
 	}
 
-	// Create output directory if needed
 	outputDir := filepath.Dir(s.OutputFilename)
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating output directory: %v\n", err)
 		return err
 	}
 
-	// Collect input filenames for concatenation
 	var inputFiles []string
 	for _, pdf := range s.InputPdf {
 		inputFiles = append(inputFiles, pdf.Filename)
 	}
 
-	// Use pdfcpu to merge PDFs with correct parameters
 	err := api.MergeCreateFile(inputFiles, s.OutputFilename, false, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error merging PDFs: %v\n", err)
@@ -59,8 +58,8 @@ func ExecuteCatOperation(s *session.TKSession) error {
 	return nil
 }
 
-// ExecuteBurstOperation performs the burst (split) operation
-func ExecuteBurstOperation(s *session.TKSession) error {
+// ExecuteBurstOperationParallel performs the burst (split) operation in parallel
+func ExecuteBurstOperationParallel(s *session.TKSession) error {
 	if len(s.InputPdf) != 1 {
 		return fmt.Errorf("burst requires exactly one input file")
 	}
@@ -94,8 +93,7 @@ func ExecuteBurstOperation(s *session.TKSession) error {
 	}
 
 	// Step 1: Split PDF into temp dir
-	err = api.SplitFile(inputPath, tempDir, 1, nil)
-	if err != nil {
+	if err := api.SplitFile(inputPath, tempDir, 1, nil); err != nil {
 		return fmt.Errorf("error during pdf split: %w", err)
 	}
 
@@ -104,40 +102,62 @@ func ExecuteBurstOperation(s *session.TKSession) error {
 	if err != nil {
 		return fmt.Errorf("cannot read temp split dir: %w", err)
 	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].Name() < entries[j].Name()
-	})
+	// Step 3: Parallel move/copy files
+	const workerCount = 4 // Anzahl paralleler Worker, ggf. anpassen
+	type job struct {
+		src  string
+		dst  string
+		page int
+	}
+	jobs := make(chan job, len(entries))
+	results := make(chan error, len(entries))
 
-	// Step 3: Move or copy files to final output
-	page := 1
-	for _, entry := range entries {
+	var wg sync.WaitGroup
+	for w := 0; w < workerCount; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				if err := os.Rename(j.src, j.dst); err != nil {
+					if err := copyFile(j.src, j.dst); err != nil {
+						results <- fmt.Errorf("page %d: %w", j.page, err)
+						continue
+					}
+				}
+				results <- nil
+			}
+		}()
+	}
+
+	for i, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
-
 		src := filepath.Join(tempDir, entry.Name())
-		dst := filepath.Join(finalOutputDir, fmt.Sprintf(filepath.Base(outputPattern), page))
+		dst := filepath.Join(finalOutputDir, fmt.Sprintf(filepath.Base(outputPattern), i+1))
+		jobs <- job{src, dst, i + 1}
+	}
+	close(jobs)
 
-		// Try to rename (fast)
-		if err := os.Rename(src, dst); err != nil {
-			// Fall back to copy if rename fails (different partitions)
-			if err := copyFile(src, dst); err != nil {
-				return fmt.Errorf("cannot write burst page: %w", err)
-			}
+	wg.Wait()
+	close(results)
+
+	for err := range results {
+		if err != nil {
+			return err
 		}
-
-		page++
 	}
 
 	if s.VerboseReporting {
-		fmt.Printf("Successfully burst into %d pages.\n", page-1)
+		fmt.Printf("Successfully burst into %d pages.\n", len(entries))
 	}
 
 	return nil
 }
 
-// A small helper for copying files safely
+// copyFile is fallback if os.Rename fails
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -151,10 +171,9 @@ func copyFile(src, dst string) error {
 	}
 	defer out.Close()
 
-	if _, err = io.Copy(out, in); err != nil {
+	if _, err := io.Copy(out, in); err != nil {
 		return err
 	}
-
 	return out.Sync()
 }
 
@@ -174,7 +193,6 @@ func ExecuteDumpDataOperation(s *session.TKSession) error {
 		}
 	}
 
-	// Determine output destination
 	var outputFile *os.File
 	var err error
 
@@ -189,8 +207,6 @@ func ExecuteDumpDataOperation(s *session.TKSession) error {
 		defer outputFile.Close()
 	}
 
-	// Use pdfcpu to get basic PDF information (simplified approach)
-	// For now, output basic metadata - full implementation would use pdfcpu's info functions
 	fmt.Fprintf(outputFile, "InfoBegin\n")
 	fmt.Fprintf(outputFile, "InfoKey: Title\n")
 	fmt.Fprintf(outputFile, "InfoValue: %s\n", filepath.Base(inputPdf.Filename))
@@ -203,9 +219,7 @@ func ExecuteDumpDataOperation(s *session.TKSession) error {
 	fmt.Fprintf(outputFile, "PdfID0: [generated-id-0]\n")
 	fmt.Fprintf(outputFile, "PdfID1: [generated-id-1]\n")
 
-	// Try to get page count using pdfcpu
-	pageCount := 1 // default
-	// Note: Would need to use appropriate pdfcpu function to get actual page count
+	pageCount := 1 // placeholder
 	fmt.Fprintf(outputFile, "NumberOfPages: %d\n", pageCount)
 
 	return nil
@@ -231,48 +245,16 @@ func ExecuteShuffleOperation(s *session.TKSession) error {
 		fmt.Printf("Output: %s\n", s.OutputFilename)
 	}
 
-	// Create output directory if needed
 	outputDir := filepath.Dir(s.OutputFilename)
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating output directory: %v\n", err)
 		return err
 	}
 
-	// For shuffle operation, we need to interleave pages from different PDFs
-	// This is a simplified implementation - would need more complex logic for full PDFtk compatibility
-
-	// Get page counts from each PDF
-	var pageCounts []int
-	for range s.InputPdf {
-		// Note: This is a simplified approach - would need to use pdfcpu API to get actual page count
-		// For now, assume each PDF has at least 1 page
-		pageCounts = append(pageCounts, 1)
-	}
-
-	// Find maximum page count
-	maxPages := 0
-	for _, count := range pageCounts {
-		if count > maxPages {
-			maxPages = count
-		}
-	}
-
-	// Create temporary files for individual pages
-	var tempFiles []string
-	defer func() {
-		// Clean up temporary files
-		for _, tempFile := range tempFiles {
-			os.Remove(tempFile)
-		}
-	}()
-
-	// Extract pages and shuffle them
-	// This is a basic implementation - full shuffle would require more complex page extraction and merging
 	fmt.Fprintf(os.Stderr, "Shuffle operation: Basic implementation in progress\n")
 	fmt.Fprintf(os.Stderr, "Note: This is a simplified shuffle that merges files sequentially\n")
 	fmt.Fprintf(os.Stderr, "Full page interleaving will be implemented in future versions\n")
 
-	// For now, perform a basic merge operation as a placeholder
 	var inputFiles []string
 	for _, pdf := range s.InputPdf {
 		inputFiles = append(inputFiles, pdf.Filename)

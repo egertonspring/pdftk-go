@@ -73,7 +73,7 @@ func mainNoExit(args []string) int {
 	case session.ShuffleK:
 		err = operations.ExecuteShuffleOperation(tkSession)
 	case session.BurstK:
-		err = operations.ExecuteBurstOperation(tkSession)
+		err = operations.ExecuteBurstOperationParallel(tkSession)
 	case session.DumpDataK, session.DumpDataUTF8K, session.DumpDataFieldsK, session.DumpDataFieldsUTF8K, session.DumpDataAnnotsK:
 		err = operations.ExecuteDumpDataOperation(tkSession)
 	default:

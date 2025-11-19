@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-
+	"sort"
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdftk-go/internal/session"
 )
@@ -55,7 +55,9 @@ func ExecuteCatOperation(s *session.TKSession) error {
 	}
 
 	return nil
-} // ExecuteBurstOperation performs the burst (split) operation
+}
+
+// ExecuteBurstOperation performs the burst (split) operation
 func ExecuteBurstOperation(s *session.TKSession) error {
 	if len(s.InputPdf) != 1 {
 		fmt.Fprintln(os.Stderr, "Error: Burst operation requires exactly one input PDF")
@@ -65,12 +67,12 @@ func ExecuteBurstOperation(s *session.TKSession) error {
 	inputPdf := s.InputPdf[0]
 	outputPattern := s.OutputFilename
 
+	// Default pattern (like pdftk)
 	if outputPattern == "" {
-		// Default burst pattern
 		base := filepath.Base(inputPdf.Filename)
 		ext := filepath.Ext(base)
 		name := base[:len(base)-len(ext)]
-		outputPattern = name + "_page_%04d.pdf"
+		outputPattern = name + "_page_%05d.pdf"
 	}
 
 	if s.VerboseReporting {
@@ -78,7 +80,7 @@ func ExecuteBurstOperation(s *session.TKSession) error {
 		fmt.Printf("Output pattern: %s\n", outputPattern)
 	}
 
-	// Create output directory
+	// Output directory
 	outputDir := filepath.Dir(outputPattern)
 	if outputDir != "." {
 		if err := os.MkdirAll(outputDir, 0755); err != nil {
@@ -87,15 +89,34 @@ func ExecuteBurstOperation(s *session.TKSession) error {
 		}
 	}
 
-	// Use pdfcpu to split PDF into individual pages
+	// --- 1) Split with pdfcpu (produces 0001.pdf, 0002.pdf, …) ---
 	err := api.SplitFile(inputPdf.Filename, outputDir, 1, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error bursting PDF: %v\n", err)
 		return err
 	}
 
+	// --- 2) Rename pdfcpu’s output files to match PDFtk pattern ---
+	files, err := filepath.Glob(filepath.Join(outputDir, "*.pdf"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading split PDFs: %v\n", err)
+		return err
+	}
+
+	// Sort for safety (0001, 0002, …)
+	sort.Strings(files)
+
+	for i, oldPath := range files {
+		newName := fmt.Sprintf(outputPattern, i+1)
+		newPath := filepath.Join(outputDir, newName)
+		if err := os.Rename(oldPath, newPath); err != nil {
+			fmt.Fprintf(os.Stderr, "Error renaming %s to %s: %v\n", oldPath, newPath, err)
+			return err
+		}
+	}
+
 	if s.VerboseReporting {
-		fmt.Printf("Successfully burst %s into individual pages\n", inputPdf.Filename)
+		fmt.Printf("Successfully burst %s into %d pages\n", inputPdf.Filename, len(files))
 	}
 
 	return nil
@@ -234,3 +255,4 @@ func ExecuteShuffleOperation(s *session.TKSession) error {
 
 	return nil
 }
+

@@ -3,11 +3,13 @@ package operations
 
 import (
 	"fmt"
+	"github.com/pdfcpu/pdfcpu/pkg/api"
+	"github.com/pdftk-go/internal/session"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
-	"github.com/pdfcpu/pdfcpu/pkg/api"
-	"github.com/pdftk-go/internal/session"
+	"strings"
 )
 
 // ExecuteCatOperation performs the concatenate operation using pdfcpu
@@ -60,66 +62,100 @@ func ExecuteCatOperation(s *session.TKSession) error {
 // ExecuteBurstOperation performs the burst (split) operation
 func ExecuteBurstOperation(s *session.TKSession) error {
 	if len(s.InputPdf) != 1 {
-		fmt.Fprintln(os.Stderr, "Error: Burst operation requires exactly one input PDF")
-		return fmt.Errorf("burst requires one input file")
+		return fmt.Errorf("burst requires exactly one input file")
 	}
 
 	inputPdf := s.InputPdf[0]
+	inputPath := inputPdf.Filename
+
+	// Determine output pattern
 	outputPattern := s.OutputFilename
-
-	// Default pattern (like pdftk)
 	if outputPattern == "" {
-		base := filepath.Base(inputPdf.Filename)
-		ext := filepath.Ext(base)
-		name := base[:len(base)-len(ext)]
-		outputPattern = name + "_page_%05d.pdf"
+		base := strings.TrimSuffix(filepath.Base(inputPath), filepath.Ext(inputPath))
+		outputPattern = base + "_page_%04d.pdf"
 	}
 
+	finalOutputDir := filepath.Dir(outputPattern)
+	if err := os.MkdirAll(finalOutputDir, 0755); err != nil {
+		return fmt.Errorf("cannot create output dir: %w", err)
+	}
+
+	// Temporary directory for splitting
+	tempDir, err := os.MkdirTemp("", "pdftk-go-burst-")
+	if err != nil {
+		return fmt.Errorf("cannot create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tempDir)
+
 	if s.VerboseReporting {
-		fmt.Printf("Bursting PDF: %s\n", inputPdf.Filename)
+		fmt.Printf("Bursting PDF: %s\n", inputPath)
 		fmt.Printf("Output pattern: %s\n", outputPattern)
+		fmt.Printf("Temporary dir: %s\n", tempDir)
 	}
 
-	// Output directory
-	outputDir := filepath.Dir(outputPattern)
-	if outputDir != "." {
-		if err := os.MkdirAll(outputDir, 0755); err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating output directory: %v\n", err)
-			return err
-		}
-	}
-
-	// --- 1) Split with pdfcpu (produces 0001.pdf, 0002.pdf, …) ---
-	err := api.SplitFile(inputPdf.Filename, outputDir, 1, nil)
+	// Step 1: Split PDF into temp dir
+	err = api.SplitFile(inputPath, tempDir, 1, nil)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error bursting PDF: %v\n", err)
-		return err
+		return fmt.Errorf("error during pdf split: %w", err)
 	}
 
-	// --- 2) Rename pdfcpu’s output files to match PDFtk pattern ---
-	files, err := filepath.Glob(filepath.Join(outputDir, "*.pdf"))
+	// Step 2: Collect and sort split files
+	entries, err := os.ReadDir(tempDir)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading split PDFs: %v\n", err)
-		return err
+		return fmt.Errorf("cannot read temp split dir: %w", err)
 	}
 
-	// Sort for safety (0001, 0002, …)
-	sort.Strings(files)
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name() < entries[j].Name()
+	})
 
-	for i, oldPath := range files {
-		newName := fmt.Sprintf(outputPattern, i+1)
-		newPath := filepath.Join(outputDir, newName)
-		if err := os.Rename(oldPath, newPath); err != nil {
-			fmt.Fprintf(os.Stderr, "Error renaming %s to %s: %v\n", oldPath, newPath, err)
-			return err
+	// Step 3: Move or copy files to final output
+	page := 1
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
 		}
+
+		src := filepath.Join(tempDir, entry.Name())
+		dst := filepath.Join(finalOutputDir, fmt.Sprintf(filepath.Base(outputPattern), page))
+
+		// Try to rename (fast)
+		if err := os.Rename(src, dst); err != nil {
+			// Fall back to copy if rename fails (different partitions)
+			if err := copyFile(src, dst); err != nil {
+				return fmt.Errorf("cannot write burst page: %w", err)
+			}
+		}
+
+		page++
 	}
 
 	if s.VerboseReporting {
-		fmt.Printf("Successfully burst %s into %d pages\n", inputPdf.Filename, len(files))
+		fmt.Printf("Successfully burst into %d pages.\n", page-1)
 	}
 
 	return nil
+}
+
+// A small helper for copying files safely
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err = io.Copy(out, in); err != nil {
+		return err
+	}
+
+	return out.Sync()
 }
 
 // ExecuteDumpDataOperation performs the dump_data operation using pdfcpu
@@ -255,4 +291,3 @@ func ExecuteShuffleOperation(s *session.TKSession) error {
 
 	return nil
 }
-

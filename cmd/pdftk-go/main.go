@@ -70,6 +70,8 @@ func mainNoExit(args []string) int {
 	switch tkSession.Operation {
 	case session.CatK:
 		err = operations.ExecuteCatOperation(tkSession)
+	case session.ShuffleK:
+		err = operations.ExecuteShuffleOperation(tkSession)
 	case session.BurstK:
 		err = operations.ExecuteBurstOperation(tkSession)
 	case session.DumpDataK, session.DumpDataUTF8K, session.DumpDataFieldsK, session.DumpDataFieldsUTF8K, session.DumpDataAnnotsK:
